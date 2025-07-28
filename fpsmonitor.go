@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -233,4 +234,9 @@ func (m *fpsMonitorImpl) dump(lastTime time.Time, count *int) time.Time {
 	m.logger.Println(builder.String())
 
 	return now
+}
+
+func SetStatus(appID, channelID, threadID uint64) {
+	dir, _ := os.Getwd()
+	GetFpsMonitor(dir, "common").Add(appID, channelID, threadID, 1)
 }
