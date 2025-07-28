@@ -3,7 +3,9 @@ package fpsmonitor
 import (
 	"fmt"
 	"log"
+	"math"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,215 +14,223 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-const (
-	logIntervalSec       = 10
-	maxValidListSize     = 100
-	minAbnormalFPS       = 8
-	maxAbnormalFPS       = 1000
-	bannerWidth          = 80
-	strftimeFormatLength = 20
-)
+const logInterval = 10
 
-type FpsStatus struct {
-	AppID     uint64
-	ChannelID uint64
-	ThreadID  uint64
+type AtomicFloat64 uint64
 
-	Value     atomic.Uint64
-	LastValue atomic.Uint64
-	LastFPS   atomic.Value // float64
-	DumpInLog bool
+func (m *AtomicFloat64) Load() float64 {
+	return math.Float64frombits(atomic.LoadUint64((*uint64)(m)))
 }
 
-type FpsMonitor struct {
-	sessionDir    string
-	fileName      string
-	lastWriteTs   int64
-	doShutdown    atomic.Bool
-	doWriteHead   atomic.Bool
-	rawLogger     *log.Logger
-	summaryLogger *log.Logger
-	resourceMap   sync.Map // key: tuple -> *FpsStatus
-	shutdownOnce  sync.Once
+func (m *AtomicFloat64) Store(val float64) {
+	atomic.StoreUint64((*uint64)(m), math.Float64bits(val))
 }
 
-var singleton *FpsMonitor
-var once sync.Once
+func (m *AtomicFloat64) Add(delta float64) float64 {
+	for {
+		oldData := m.Load()
+		newData := oldData + delta
 
-func GetInstance(sessionDir, fileName string) *FpsMonitor {
-	once.Do(func() {
-		singleton = &FpsMonitor{
-			sessionDir:  sessionDir,
-			fileName:    fileName,
-			lastWriteTs: time.Now().UnixMilli(),
-		}
-		singleton.rawLogger = newRawRotatingLogger(filepath.Join(sessionDir, fileName+".log"))
-		singleton.summaryLogger = newRawRotatingLogger(filepath.Join(sessionDir, fileName+"_summary.log"))
-		singleton.doWriteHead.Store(true)
-		go singleton.run()
-	})
-	return singleton
-}
-
-func newRawRotatingLogger(logPath string) *log.Logger {
-	writer := &lumberjack.Logger{
-		Filename:   logPath,
-		MaxSize:    5,
-		MaxBackups: 3,
-		MaxAge:     28,
-		Compress:   true,
-	}
-	return log.New(writer, "", 0)
-}
-
-func (m *FpsMonitor) SetStatus(appID, channelID, threadID uint64, dump bool) *atomic.Uint64 {
-	key := fmt.Sprintf("%d-%d-%d", appID, channelID, threadID)
-	val, loaded := m.resourceMap.Load(key)
-	if loaded {
-		status := val.(*FpsStatus)
-		status.DumpInLog = dump
-		status.Value.Add(1)
-		return &status.Value
-	}
-
-	status := &FpsStatus{
-		AppID:     appID,
-		ChannelID: channelID,
-		ThreadID:  threadID,
-		DumpInLog: dump,
-	}
-	status.LastFPS.Store(float64(0))
-	status.Value.Add(1)
-	m.resourceMap.Store(key, status)
-	return &status.Value
-}
-
-func (m *FpsMonitor) run() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	var lastSize int
-	for !m.doShutdown.Load() {
-		select {
-		case <-ticker.C:
-			currentSize := 0
-			m.resourceMap.Range(func(_, _ any) bool {
-				currentSize++
-				return true
-			})
-			if currentSize != lastSize {
-				m.doWriteHead.Store(true)
-				lastSize = currentSize
-			}
-
-			if time.Now().Unix()%logIntervalSec == 0 {
-				m.writeData()
-			}
+		if atomic.CompareAndSwapUint64((*uint64)(m), math.Float64bits(oldData), math.Float64bits(newData)) {
+			return newData
 		}
 	}
-	m.writeData()
 }
 
-func (m *FpsMonitor) writeData() {
-	m.calculateFPS()
-	if m.doWriteHead.Swap(false) {
-		m.writeHeader()
-	}
-
-	var validList, invalidList []string
-	now := time.Now().Format("15:04:05")
-
-	var data strings.Builder
-	m.resourceMap.Range(func(key, value any) bool {
-		status := value.(*FpsStatus)
-		if !status.DumpInLog {
-			return true
-		}
-		fps := status.LastFPS.Load().(float64)
-		data.WriteString(fmt.Sprintf("%s %04d.%04d.%04d %9.1f|\n", now, status.AppID, status.ChannelID, status.ThreadID, fps))
-		if fps >= minAbnormalFPS && fps <= maxAbnormalFPS {
-			validList = append(validList, key.(string))
-		} else {
-			invalidList = append(invalidList, key.(string))
-		}
-		return true
-	})
-
-	if data.Len() > 0 {
-		m.rawLogger.Print(data.String())
-	}
-
-	m.summaryLogger.Printf("%s Valid   (x2) (%04d): %s", now, len(validList), strings.Join(validList, " "))
-	m.summaryLogger.Printf("%s Invalid (x2) (%04d): %s", now, len(invalidList), strings.Join(invalidList, " "))
-	m.summaryLogger.Printf("%s --------------", now)
+type FpsMonitor interface {
+	Register(appID, chID, threadID uint64)
+	Add(appID, chID, threadID, count uint64)
+	Load(appID, chID, threadID uint64) (fps float64)
+	Shutdown()
 }
 
-func (m *FpsMonitor) calculateFPS() {
-	now := time.Now().UnixMilli()
-	diff := now - m.lastWriteTs
-	if diff <= 0 {
+type fpsKey struct {
+	AppID, ChID, ThreadID uint64
+}
+
+// String implements fmt.Stringer.
+func (m fpsKey) String() string {
+	return fmt.Sprintf("%04d.%04d.%04d", m.AppID, m.ChID, m.ThreadID)
+}
+
+type status struct {
+	count   atomic.Uint64
+	lastFps AtomicFloat64
+}
+
+type fpsMonitorImpl struct {
+	muStats sync.RWMutex
+	stats   map[string]*status
+	wg      sync.WaitGroup
+	quit    chan struct{}
+	logger  *log.Logger
+}
+
+// Add implements FpsMonitor.
+func (m *fpsMonitorImpl) Add(appID uint64, chID uint64, threadID uint64, count uint64) {
+	key := fpsKey{appID, chID, threadID}.String()
+
+	m.muStats.RLock()
+	s, ok := m.stats[key]
+	m.muStats.RUnlock()
+
+	if ok {
+		s.count.Add(count)
+
 		return
 	}
-	m.resourceMap.Range(func(_, value any) bool {
-		status := value.(*FpsStatus)
-		delta := status.Value.Load() - status.LastValue.Load()
-		fps := float64(delta) * 1000.0 / float64(diff)
-		status.LastFPS.Store(fps)
-		status.LastValue.Store(status.Value.Load())
-		return true
-	})
-	m.lastWriteTs = now
+
+	m.Register(appID, chID, threadID)
 }
 
-func (m *FpsMonitor) writeHeader() {
-	now := time.Now().Format("2006-01-02 15:04:05")
-	banner := fmt.Sprintf("\n┌%s┐\n│%s│\n└%s┘\n",
-		strings.Repeat("─", bannerWidth),
-		centerText("UTC: "+now, bannerWidth),
-		strings.Repeat("─", bannerWidth),
-	)
-	m.rawLogger.Print(banner)
+// Load implements FpsMonitor.
+func (m *fpsMonitorImpl) Load(appID uint64, chID uint64, threadID uint64) float64 {
+	key := fpsKey{appID, chID, threadID}.String()
 
-	var hdr strings.Builder
-	count := 0
-	m.resourceMap.Range(func(_, value any) bool {
-		status := value.(*FpsStatus)
-		if status.DumpInLog {
-			hdr.WriteString(fmt.Sprintf("Time     %04d.%04d.%04d        Fps|", status.AppID, status.ChannelID, status.ThreadID))
+	m.muStats.RLock()
+	s, ok := m.stats[key]
+	m.muStats.RUnlock()
+
+	if ok {
+		return s.lastFps.Load()
+	}
+
+	return 0.0
+}
+
+// Register implements FpsMonitor.
+func (m *fpsMonitorImpl) Register(appID uint64, chID uint64, threadID uint64) {
+	key := fpsKey{appID, chID, threadID}.String()
+
+	m.muStats.Lock()
+	defer m.muStats.Unlock()
+
+	if _, ok := m.stats[key]; !ok {
+		m.stats[key] = &status{ //nolint:exhaustruct
+			lastFps: 0.0,
 		}
-		count++
-		return true
-	})
-
-	if hdr.Len() > 0 {
-		m.rawLogger.Println(hdr.String())
 	}
-	m.summaryLogger.Printf("Total channels (x2) %d", count)
 }
 
-func countMap(m *sync.Map) int {
+// Shutdown implements FpsMonitor.
+func (m *fpsMonitorImpl) Shutdown() {
+	stopOnce.Do(func() {
+		close(m.quit)
+		m.wg.Wait()
+	})
+}
+
+var (
+	monitorInstance FpsMonitor //nolint:gochecknoglobals
+	startOnce       sync.Once  //nolint:gochecknoglobals
+	stopOnce        sync.Once  //nolint:gochecknoglobals
+)
+
+// GetFpsMonitor returns the singleton instance.
+//
+//nolint:ireturn
+func GetFpsMonitor(dir, suffix string) FpsMonitor {
+	startOnce.Do(func() {
+		logPath := filepath.Join(dir, "fps_"+suffix+".log")
+		monitorInstance = newFpsMonitorImpl(logPath)
+	})
+
+	return monitorInstance
+}
+
+func newFpsMonitorImpl(logPath string) *fpsMonitorImpl {
+	m := &fpsMonitorImpl{
+		muStats: sync.RWMutex{},
+		stats:   make(map[string]*status),
+		wg:      sync.WaitGroup{},
+		quit:    make(chan struct{}),
+		logger: log.New(&lumberjack.Logger{ //nolint:exhaustruct
+			Filename:   logPath,
+			MaxSize:    5, //nolint:mnd
+			MaxBackups: 3, //nolint:mnd
+			MaxAge:     0,
+			Compress:   false,
+		}, "", 0),
+	}
+
+	m.wg.Add(1)
+
+	go m.run()
+
+	return m
+}
+
+func (m *fpsMonitorImpl) run() {
+	ticker := time.NewTicker(logInterval * time.Second)
+	defer func() {
+		ticker.Stop()
+		m.wg.Done()
+	}()
+
+	lastTime := time.Now()
 	count := 0
-	m.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
-	return count
-}
 
-func centerText(s string, width int) string {
-	if len(s) >= width {
-		return s
+	for {
+		select {
+		case <-ticker.C:
+			lastTime = m.dump(lastTime, &count)
+			count--
+		case <-m.quit:
+			return
+		}
 	}
-	pad := (width - len(s)) / 2
-	return strings.Repeat(" ", pad) + s + strings.Repeat(" ", width-len(s)-pad)
 }
 
-func (m *FpsMonitor) Shutdown() {
-	m.shutdownOnce.Do(func() {
-		m.doShutdown.Store(true)
-	})
+func (m *fpsMonitorImpl) dumpHeader(now time.Time, keys []string) string {
+	var builder strings.Builder
+	for range keys {
+		builder.WriteString("Time     App .Chn .Thr       Fps|")
+	}
+
+	builder.WriteByte('\n')
+
+	for _, key := range keys {
+		builder.WriteString(fmt.Sprintf("%s %s      fps|", now.Format("06-01-02"), key))
+	}
+
+	builder.WriteByte('\n')
+
+	return builder.String()
 }
 
-func SetStatus(appID, channelID, threadID uint64) {
-	GetInstance("session", "fps_common").SetStatus(appID, channelID, threadID, true)
+func (m *fpsMonitorImpl) dump(lastTime time.Time, count *int) time.Time {
+	now := time.Now()
+	diff := now.Sub(lastTime)
+
+	m.muStats.RLock()
+
+	keys := make([]string, 0, len(m.stats))
+	for k := range m.stats {
+		keys = append(keys, k)
+	}
+	m.muStats.RUnlock()
+	sort.Strings(keys)
+
+	var builder strings.Builder
+
+	if *count == 0 {
+		*count = 100
+
+		builder.WriteString(m.dumpHeader(now, keys))
+	}
+
+	for _, key := range keys {
+		m.muStats.RLock()
+		s := m.stats[key]
+		m.muStats.RUnlock()
+
+		current := s.count.Swap(0)
+		fps := float64(current) * 1000.0 / float64(diff.Milliseconds()) //nolint:mnd
+		s.lastFps.Store(fps)
+		builder.WriteString(fmt.Sprintf("%s %s %8.1f|", now.Format("15:04:05"), key, fps))
+	}
+
+	m.logger.Println(builder.String())
+
+	return now
 }

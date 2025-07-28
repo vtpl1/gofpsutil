@@ -1,25 +1,24 @@
-package fpsmonitor
+package fpsmonitor_test
 
 import (
 	"os"
 	"testing"
 	"time"
+
+	fpsmonitor "github.com/vtpl1/gofpsutil"
 )
 
 func TestFpsMonitor_PublicAPI_Behavior(t *testing.T) {
 	// Get singleton instance
 	dir, _ := os.Getwd()
 	prefix := "public_api_test"
-	monitor := GetInstance(dir, prefix)
-
-	// Set counters
-	counterValid := monitor.SetStatus(1, 2, 3, true)
-	counterInvalid := monitor.SetStatus(4, 5, 6, true)
-
+	monitor := fpsmonitor.GetFpsMonitor(dir, prefix)
+	defer monitor.Shutdown()
 	// Simulate FPS updates
-	for i := 0; i < 20000; i++ {
-		(*counterValid).Add(1)
-		(*counterInvalid).Add(1)
+	for i := 0; i < 15000; i++ {
+		monitor.Add(1, 2, 3, 1)
+		monitor.Add(4, 5, 6, 1)
+		monitor.Add(1, 5, 6, 1)
 		// Wait for internal writer to flush (1s interval)
 		time.Sleep(time.Millisecond)
 	}
